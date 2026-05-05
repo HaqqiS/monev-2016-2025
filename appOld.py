@@ -1,12 +1,12 @@
 """
-MONEV MONITOR v4
-================
-Fix utama:
-- Audit & laporan data quality issues secara transparan
-- Tipe 1: Duplikat identik → hapus salah satu
-- Tipe 2: Konflik kualifikasi (nama+region+tahun sama tapi kualifikasi beda) → simpan keduanya dengan flag, bukan dihapus
-- Tipe 3: Karakter \n / \r\n dalam nama badan → dibersihkan sebelum proses
-- Region-aware make_key() tetap dipertahankan
+MONEV MONITOR
+=============
+Fix utama v3:
+- make_key() kini strip nama wilayah (region) dari dalam nama badan
+  sehingga "dinas sosial kabupaten badung" dan "dinas sosial" dengan
+  region=Badung menghasilkan key yang sama → ter-cluster dengan benar.
+- Entity resolution menggunakan composite (badan_key + region) 
+  sebagai unit pencocokan, bukan hanya nama.
 """
 
 import streamlit as st
@@ -17,10 +17,16 @@ from collections import defaultdict
 
 st.set_page_config(page_title="MONEV MONITOR", layout="wide", page_icon="📊")
 
+# ════════════════════════════════════════════════════════════════════
+# KONFIGURASI
+# ════════════════════════════════════════════════════════════════════
+
+# Semua nama wilayah Bali yang mungkin muncul di dalam nama badan
 WILAYAH_BALI = [
-    'badung','buleleng','gianyar','tabanan','klungkung',
-    'karangasem','bangli','jembrana','denpasar','bali',
+    'badung', 'buleleng', 'gianyar', 'tabanan', 'klungkung',
+    'karangasem', 'bangli', 'jembrana', 'denpasar', 'bali',
 ]
+
 SINGKATAN_MAP = {
     r'\bbappeda\b': 'badan perencanaan pembangunan daerah',
     r'\bbalitbang\b': 'badan penelitian dan pengembangan',
@@ -37,18 +43,22 @@ SINGKATAN_MAP = {
     r'\bbapedalibang\b': 'badan perencanaan penelitian dan pengembangan',
     r'\bdprd\b': 'dewan perwakilan rakyat daerah',
 }
+
 KUALIFIKASI_ORDER = [
-    'Informatif','Menuju Informatif','Cukup Informatif',
-    'Kurang Informatif','Tidak Informatif','Tidak Diketahui',
+    'Informatif', 'Menuju Informatif', 'Cukup Informatif',
+    'Kurang Informatif', 'Tidak Informatif', 'Tidak Diketahui',
 ]
 KUAL_ICON = {
-    'Informatif': '🟢', 'Menuju Informatif': '🔵',
-    'Cukup Informatif': '🟡', 'Kurang Informatif': '🟠',
-    'Tidak Informatif': '🔴', 'Tidak Diketahui': '⚪',
+    'Informatif': '🟢',
+    'Menuju Informatif': '🔵',
+    'Cukup Informatif': '🟡',
+    'Kurang Informatif': '🟠',
+    'Tidak Informatif': '🔴',
+    'Tidak Diketahui': '⚪',
 }
 
 # ════════════════════════════════════════════════════════════════════
-# 1. LOAD
+# 1. LOAD DATA
 # ════════════════════════════════════════════════════════════════════
 @st.cache_data
 def load_data(path="dataterbaru.csv"):
@@ -64,37 +74,7 @@ if err or df_raw is None:
     st.stop()
 
 # ════════════════════════════════════════════════════════════════════
-# 2. DATA QUALITY AUDIT
-# Jalankan SEBELUM normalisasi agar audit berbasis data mentah.
-# Hasilkan laporan issues yang transparan ke user.
-# ════════════════════════════════════════════════════════════════════
-@st.cache_data
-def audit_data_quality(df):
-    df = df.copy()
-    df.columns = df.columns.str.strip().str.lower()
-    df = df.rename(columns={'badan publik':'badan','provinsi/kabupaten/kota':'region'})
-    df['badan'] = df['badan'].astype(str)
-
-    issues = {}
-
-    # Tipe 1: Duplikat identik (semua kolom sama)
-    mask_t1 = df.duplicated(subset=['badan','region','tahun','kualifikasi'], keep=False)
-    issues['duplikat_identik'] = df[mask_t1].copy()
-
-    # Tipe 2: Konflik kualifikasi (nama+region+tahun sama, kualifikasi BEDA)
-    mask_t2 = df.duplicated(subset=['badan','region','tahun'], keep=False) & ~mask_t1
-    issues['konflik_kualifikasi'] = df[mask_t2].copy()
-
-    # Tipe 3: Nama badan mengandung karakter newline
-    mask_t3 = df['badan'].str.contains(r'\n|\r', na=False)
-    issues['nama_berisi_newline'] = df[mask_t3].copy()
-
-    return issues
-
-dq_issues = audit_data_quality(df_raw)
-
-# ════════════════════════════════════════════════════════════════════
-# 3. NORMALISASI + CLEANING
+# 2. NORMALISASI
 # ════════════════════════════════════════════════════════════════════
 @st.cache_data
 def normalize_data(df):
@@ -114,38 +94,48 @@ def normalize_data(df):
 
     df = df[required].copy()
 
-    # ── Bersihkan nama badan ───────────────────────────────────────
+    # ── Nama badan: bersihkan untuk tampilan ──────────────────────
     def clean_display(name):
-        if not isinstance(name, str): return ""
-        # FIX TIPE 3: hapus \n dan \r
-        name = re.sub(r'[\n\r]+', ' ', name)
+        if not isinstance(name, str):
+            return ""
         name = re.sub(r'\s+', ' ', name)
         name = re.sub(r'([a-z])([A-Z])', r'\1 \2', name)
         return name.strip()
 
+    # ── Region: seragamkan, strip "Kabupaten"/"Kota" prefix ───────
     def clean_region(r):
-        if not isinstance(r, str): return "Unknown"
-        r = re.sub(r'[\n\r]+', ' ', r)
+        if not isinstance(r, str):
+            return "Unknown"
         r = re.sub(r'^(Kabupaten|Kota)\s+', '', r.strip(), flags=re.IGNORECASE)
         return r.strip().title() or "Unknown"
 
-    # ── Kunci region-aware untuk matching ─────────────────────────
+    # ── Kunci matching: strip wilayah dari nama badan ─────────────
+    # INI INTI PERBAIKAN:
+    # "Dinas Sosial Kabupaten Badung" + region=Badung → "dinas sosial"
+    # "dinas sosial"                  + region=Badung → "dinas sosial"
+    # Keduanya menghasilkan key identik → akan di-cluster menjadi satu.
     def make_key(name, region):
-        if not isinstance(name, str): return ""
+        if not isinstance(name, str):
+            return ""
         key = name.lower()
-        key = re.sub(r'[\n\r]+', ' ', key)
         key = re.sub(r'\s+', ' ', key)
         key = re.sub(r'([a-z])([A-Z])', r'\1 \2', key)
+        # Hapus kata generik lokasi
         key = re.sub(r'\b(kabupaten|kota|provinsi)\b', '', key)
+        # Hapus nama wilayah yang ada di kolom region
         if region and region != "Unknown":
-            key = re.sub(r'\b' + re.escape(region.lower().strip()) + r'\b', '', key)
+            reg = region.lower().strip()
+            key = re.sub(r'\b' + re.escape(reg) + r'\b', '', key)
+        # Hapus semua nama wilayah Bali yang diketahui
         for w in WILAYAH_BALI:
             key = re.sub(r'\b' + re.escape(w) + r'\b', '', key)
+        # Ekspansi singkatan setelah strip wilayah
         for pat, rep in SINGKATAN_MAP.items():
             key = re.sub(pat, rep, key)
-        return re.sub(r'\s+', ' ', key).strip()
+        key = re.sub(r'\s+', ' ', key).strip()
+        return key
 
-    df['badan']  = df['badan'].astype(str).apply(clean_display)
+    df['badan'] = df['badan'].astype(str).apply(clean_display)
     df['region'] = df['region'].apply(clean_region)
     df['badan_key'] = df.apply(lambda r: make_key(r['badan'], r['region']), axis=1)
 
@@ -168,20 +158,7 @@ def normalize_data(df):
     df = df.dropna(subset=['tahun'])
     df['tahun'] = df['tahun'].astype(int)
 
-    # ── Hapus duplikat identik (TIPE 1) ───────────────────────────
-    before = len(df)
-    df = df.drop_duplicates(subset=['badan_key', 'region', 'tahun', 'kualifikasi'])
-    n_t1 = before - len(df)
-
-    # ── Tandai konflik kualifikasi (TIPE 2) — JANGAN dihapus ──────
-    # Jika nama+region+tahun sama tapi kualifikasi beda, simpan semua
-    # dan beri flag. User bisa melihat di tab audit.
-    df['is_konflik'] = df.duplicated(subset=['badan_key', 'region', 'tahun'], keep=False)
-
-    warnings = []
-    if n_bad:  warnings.append(f"⚠️ {n_bad} baris dibuang karena tahun tidak valid.")
-    if n_t1:   warnings.append(f"ℹ️ {n_t1} baris duplikat identik dihapus.")
-
+    warnings = [f"⚠️ {n_bad} baris dibuang (tahun tidak valid)."] if n_bad else []
     return df, warnings
 
 df, warnings = normalize_data(df_raw)
@@ -190,17 +167,24 @@ if df is None:
     st.stop()
 
 # ════════════════════════════════════════════════════════════════════
-# 4. ENTITY RESOLUTION
+# 3. ENTITY RESOLUTION
+# Karena make_key sudah strip wilayah, dua nama yang sama fungsinya
+# di wilayah yang sama akan punya key identik atau sangat mirip.
+# Union-Find menggabungkan cluster tersebut.
 # ════════════════════════════════════════════════════════════════════
 @st.cache_data
 def entity_resolution(df, threshold=0.85):
-    def ratio(a, b): return SequenceMatcher(None, a, b).ratio()
 
+    def ratio(a, b):
+        return SequenceMatcher(None, a, b).ratio()
+
+    # Unik per (badan_key, region) — ini unit pencocokan
     unique = (
         df[['badan_key', 'badan', 'region']]
         .drop_duplicates(subset=['badan_key', 'region'])
         .reset_index(drop=True)
     )
+
     parent = list(range(len(unique)))
 
     def find(x):
@@ -209,30 +193,44 @@ def entity_resolution(df, threshold=0.85):
             x = parent[x]
         return x
 
-    def union(x, y): parent[find(x)] = find(y)
+    def union(x, y):
+        parent[find(x)] = find(y)
 
-    keys = unique['badan_key'].tolist()
+    keys    = unique['badan_key'].tolist()
     regions = unique['region'].tolist()
-    names = unique['badan'].tolist()
+    names   = unique['badan'].tolist()
 
     for i in range(len(unique)):
         for j in range(i + 1, len(unique)):
-            if regions[i] != regions[j]: continue
+            # Hanya bandingkan dalam wilayah yang sama
+            if regions[i] != regions[j]:
+                continue
+
             ka, kb = keys[i], keys[j]
+
+            # Key identik → pasti sama
             if ka == kb:
-                union(i, j); continue
+                union(i, j)
+                continue
+
+            # Substring match dengan filter rasio panjang
             mn = min(len(ka), len(kb))
             mx = max(len(ka), len(kb))
             if mn >= 8 and mx > 0 and (ka in kb or kb in ka):
                 if mn / mx >= 0.55:
-                    union(i, j); continue
+                    union(i, j)
+                    continue
+
+            # Fuzzy match
             if ratio(ka, kb) >= threshold:
                 union(i, j)
 
+    # Bangun canonical map: key → nama canonical (terpanjang di cluster)
     clusters = defaultdict(list)
     for i in range(len(unique)):
         clusters[find(i)].append(i)
 
+    # Mapping: (badan_key, region) → canonical_name
     canonical_map = {}
     for group in clusters.values():
         group_names = [names[i] for i in group]
@@ -242,31 +240,26 @@ def entity_resolution(df, threshold=0.85):
 
     df = df.copy()
     df['badan_canonical'] = df.apply(
-        lambda r: canonical_map.get((r['badan_key'], r['region']), r['badan']), axis=1
+        lambda r: canonical_map.get((r['badan_key'], r['region']), r['badan']),
+        axis=1
     )
     return df
 
 df = entity_resolution(df)
 
+# Hapus duplikat sejati
+df = df.drop_duplicates(subset=['badan_canonical', 'region', 'tahun'])
+
 # ════════════════════════════════════════════════════════════════════
-# 5. SUMMARY
+# 4. SUMMARY
 # ════════════════════════════════════════════════════════════════════
 @st.cache_data
 def build_summary(df):
-    # Untuk summary, jika ada konflik kualifikasi ambil kualifikasi terbaik
-    # (urutan: Informatif > Menuju > Cukup > Kurang > Tidak > Tidak Diketahui)
-    kual_rank = {k: i for i, k in enumerate(KUALIFIKASI_ORDER)}
-
     rows = []
     for (nama, region), g in df.groupby(['badan_canonical', 'region']):
-        tahun_unik = sorted(g['tahun'].unique())
-        info_tahun = sorted(g.loc[g['kualifikasi'] == 'Informatif', 'tahun'].unique())
-        last_year  = max(tahun_unik)
-        last_kuals = g[g['tahun'] == last_year]['kualifikasi'].tolist()
-        # Jika ada konflik di tahun terakhir, pilih yang terbaik (rank terkecil)
-        last_kual  = min(last_kuals, key=lambda x: kual_rank.get(x, 99))
-        has_conflict = g['is_konflik'].any()
-
+        tahun_unik  = sorted(g['tahun'].unique())
+        info_tahun  = sorted(g.loc[g['kualifikasi'] == 'Informatif', 'tahun'].unique())
+        last_kual   = g.sort_values('tahun').iloc[-1]['kualifikasi']
         rows.append({
             'Nama Badan Publik': nama,
             'Wilayah':           region,
@@ -274,7 +267,6 @@ def build_summary(df):
             'Tahun Monev':       ', '.join(map(str, tahun_unik)),
             'Tahun Informatif':  ', '.join(map(str, info_tahun)) if info_tahun else '-',
             'Status Terakhir':   last_kual,
-            '⚠️ Konflik Data':   '⚠️ Ya' if has_conflict else '',
         })
     return (
         pd.DataFrame(rows)
@@ -285,7 +277,7 @@ def build_summary(df):
 summary_df = build_summary(df)
 
 # ════════════════════════════════════════════════════════════════════
-# 6. KPI
+# 5. KPI HEADER
 # ════════════════════════════════════════════════════════════════════
 st.markdown("## 📊 MONEV MONITOR")
 for w in warnings:
@@ -302,11 +294,10 @@ c4.metric("🏆 Pernah Informatif",    f"{(summary_df['Tahun Informatif']!='-').
 st.divider()
 
 # ════════════════════════════════════════════════════════════════════
-# 7. TABS
+# 6. TABS
 # ════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📋 Ringkasan", "📈 Tren & Distribusi",
-    "🗂️ Data Mentah", "🏛️ Profil Badan", "🔍 Audit Data"
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📋 Ringkasan", "📈 Tren & Distribusi", "🗂️ Data Mentah", "🏛️ Profil Badan"
 ])
 
 # ── TAB 1: RINGKASAN ─────────────────────────────────────────────
@@ -324,9 +315,9 @@ with tab1:
     cari = st.text_input("🔍 Cari nama badan publik")
 
     filt = summary_df.copy()
-    if wil_sel    != "Semua":      filt = filt[filt['Wilayah'] == wil_sel]
-    if status_sel != "Semua":      filt = filt[filt['Status Terakhir'] == status_sel]
-    if info_sel   == "Pernah":     filt = filt[filt['Tahun Informatif'] != '-']
+    if wil_sel    != "Semua":     filt = filt[filt['Wilayah'] == wil_sel]
+    if status_sel != "Semua":     filt = filt[filt['Status Terakhir'] == status_sel]
+    if info_sel   == "Pernah":    filt = filt[filt['Tahun Informatif'] != '-']
     if info_sel   == "Belum Pernah": filt = filt[filt['Tahun Informatif'] == '-']
     if cari:
         filt = filt[filt['Nama Badan Publik'].str.contains(cari, case=False, na=False)]
@@ -346,7 +337,7 @@ with tab1:
         "ringkasan_monev.csv", "text/csv"
     )
 
-# ── TAB 2: TREN ───────────────────────────────────────────────────
+# ── TAB 2: TREN & DISTRIBUSI ──────────────────────────────────────
 with tab2:
     st.subheader("Distribusi Kualifikasi per Tahun")
     dist = df.groupby(['tahun', 'kualifikasi']).size().reset_index(name='Jumlah')
@@ -366,7 +357,8 @@ with tab2:
 
 # ── TAB 3: DATA MENTAH ────────────────────────────────────────────
 with tab3:
-    st.subheader("Data Mentah (setelah normalisasi)")
+    st.subheader("Data Mentah (setelah normalisasi & entity resolution)")
+
     d1, d2 = st.columns(2)
     with d1:
         thn_raw = st.selectbox("Filter Tahun", ["Semua"] + tahun_list, key="raw_thn")
@@ -377,17 +369,18 @@ with tab3:
     if thn_raw != "Semua": raw = raw[raw['tahun'] == thn_raw]
     if reg_raw != "Semua": raw = raw[raw['region'] == reg_raw]
 
-    disp_raw = raw[['badan_canonical','region','tahun','kualifikasi','is_konflik']].rename(columns={
-        'badan_canonical':'Nama Badan Publik','region':'Wilayah',
-        'tahun':'Tahun','kualifikasi':'Kualifikasi','is_konflik':'Konflik?'
+    disp_raw = raw[['badan_canonical', 'region', 'tahun', 'kualifikasi']].rename(columns={
+        'badan_canonical': 'Nama Badan Publik', 'region': 'Wilayah',
+        'tahun': 'Tahun', 'kualifikasi': 'Kualifikasi',
     }).reset_index(drop=True)
     disp_raw.index += 1
     st.dataframe(disp_raw, use_container_width=True)
     st.caption(f"{len(disp_raw):,} records")
 
-# ── TAB 4: PROFIL ─────────────────────────────────────────────────
+# ── TAB 4: PROFIL BADAN ───────────────────────────────────────────
 with tab4:
     st.subheader("Profil Detail Badan Publik")
+
     p1, p2 = st.columns([1, 2])
     with p1:
         wil_p = st.selectbox("Wilayah", ["Semua"] + sorted(df['region'].unique()), key="prof_wil")
@@ -403,74 +396,25 @@ with tab4:
         st.markdown(f"**Wilayah:** {row['Wilayah']}")
 
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Jumlah Monev",     row['Jumlah Monev'])
-        m2.metric("Tahun Monev",      row['Tahun Monev'])
-        m3.metric("Tahun Informatif", row['Tahun Informatif'])
-        m4.metric("Status Terakhir",  f"{KUAL_ICON.get(row['Status Terakhir'],'⚪')} {row['Status Terakhir']}")
+        m1.metric("Jumlah Monev",    row['Jumlah Monev'])
+        m2.metric("Tahun Monev",     row['Tahun Monev'])
+        m3.metric("Tahun Informatif",row['Tahun Informatif'])
+        m4.metric("Status Terakhir", f"{KUAL_ICON.get(row['Status Terakhir'],'⚪')} {row['Status Terakhir']}")
 
-        hist = bdata[['tahun','kualifikasi','is_konflik']].rename(
-            columns={'tahun':'Tahun','kualifikasi':'Kualifikasi','is_konflik':'Konflik?'}
+        hist = bdata[['tahun', 'kualifikasi']].rename(
+            columns={'tahun': 'Tahun', 'kualifikasi': 'Kualifikasi'}
         ).reset_index(drop=True)
         hist['Kualifikasi'] = hist['Kualifikasi'].apply(
             lambda x: f"{KUAL_ICON.get(x,'⚪')} {x}"
         )
         st.dataframe(hist, use_container_width=True, hide_index=True)
 
+        # Tampilkan varian nama asli yang digabungkan
         variants = sorted(bdata['badan'].unique())
         if len(variants) > 1:
-            with st.expander(f"ℹ️ {len(variants)} varian nama digabungkan"):
+            with st.expander(f"ℹ️ {len(variants)} varian nama digabungkan (Entity Resolution)"):
                 for v in variants:
                     st.write(f"• {v}")
 
-# ── TAB 5: AUDIT DATA ─────────────────────────────────────────────
-with tab5:
-    st.subheader("🔍 Laporan Kualitas Data")
-
-    total_raw  = len(df_raw)
-    total_proc = len(df)
-
-    col_a, col_b, col_c = st.columns(3)
-    col_a.metric("Data Masuk (CSV)", f"{total_raw:,}")
-    col_b.metric("Data Diproses", f"{total_proc:,}")
-    col_c.metric("Selisih", f"{total_raw - total_proc:,}", delta_color="inverse")
-
-    st.markdown("---")
-
-    # Tipe 1
-    t1 = dq_issues['duplikat_identik']
-    with st.expander(f"🔴 Tipe 1 — Duplikat Identik ({len(t1)} baris, {len(t1)//2} pasang)"):
-        st.markdown("Baris dengan **nama + wilayah + tahun + kualifikasi** yang 100% sama. Salah satu dihapus otomatis.")
-        if len(t1):
-            st.dataframe(t1[['badan','region','tahun','kualifikasi']].reset_index(drop=True), use_container_width=True, hide_index=True)
-
-    # Tipe 2
-    t2 = dq_issues['konflik_kualifikasi']
-    with st.expander(f"🟠 Tipe 2 — Konflik Kualifikasi ({len(t2)} baris, perlu verifikasi manual)"):
-        st.markdown("""
-        Baris dengan **nama + wilayah + tahun sama** tetapi **kualifikasi berbeda**.  
-        Kemungkinan penyebab: data diinput dua kali dengan hasil berbeda.  
-        **Kedua baris tetap disimpan.** Untuk summary, diambil kualifikasi terbaik.  
-        ⚠️ **Disarankan untuk diverifikasi ke sumber data asli.**
-        """)
-        if len(t2):
-            st.dataframe(t2[['badan','region','tahun','kualifikasi']].reset_index(drop=True), use_container_width=True, hide_index=True)
-
-    # Tipe 3
-    t3 = dq_issues['nama_berisi_newline']
-    with st.expander(f"🟡 Tipe 3 — Nama Badan Berisi Karakter Newline ({len(t3)} baris)"):
-        st.markdown("Nama badan mengandung `\\n` atau `\\r` (kemungkinan copy-paste dari PDF/Excel). Sudah dibersihkan otomatis.")
-        if len(t3):
-            st.dataframe(t3[['badan','region','tahun','kualifikasi']].reset_index(drop=True), use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-    st.markdown(f"""
-    **Rekap:**
-    - ✅ {total_raw:,} baris masuk dari CSV
-    - 🗑️ {len(t1)//2} baris dihapus karena duplikat identik
-    - ⚠️ {len(t2)} baris konflik kualifikasi (disimpan, perlu verifikasi)
-    - 🔧 {len(t3)} baris diperbaiki (newline dibersihkan)
-    - 📊 **{total_proc:,} baris aktif diproses**
-    """)
-
 st.divider()
-st.caption("🔧 Region-Aware Normalisasi · Fuzzy Matching · Entity Resolution · Data Quality Audit | MONEV MONITOR")
+st.caption("🔧 Region-Aware Normalisasi · Fuzzy Matching · Entity Resolution | MONEV MONITOR")
